@@ -8,7 +8,7 @@ require (
 	// TODO(hidde): introduction of the runtime package is temporary, and the dependency should be removed as soon as
 	//  all APIs have been updated to the runtime standards (more specifically; have dropped their condition modifying
 	//  functions).
-	github.com/fluxcd/pkg/runtime v0.13.0-rc.2
+	github.com/fluxcd/pkg/runtime v0.13.0-rc.3
 	k8s.io/apimachinery v0.22.2
 	sigs.k8s.io/controller-runtime v0.10.2
 )
