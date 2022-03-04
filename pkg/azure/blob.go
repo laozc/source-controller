@@ -44,13 +44,14 @@ var (
 )
 
 const (
-	resourceIDField                = "resourceId"
-	clientIDField                  = "clientId"
-	tenantIDField                  = "tenantId"
-	clientSecretField              = "clientSecret"
-	clientCertificateField         = "clientCertificate"
-	clientCertificatePasswordField = "clientCertificatePassword"
-	accountKeyField                = "accountKey"
+	resourceIDField                 = "resourceId"
+	clientIDField                   = "clientId"
+	tenantIDField                   = "tenantId"
+	clientSecretField               = "clientSecret"
+	clientCertificateField          = "clientCertificate"
+	clientCertificatePasswordField  = "clientCertificatePassword"
+	clientCertificateSendChainField = "clientCertificateSendChain"
+	accountKeyField                 = "accountKey"
 )
 
 // BlobClient is a minimal Azure Blob client for fetching objects.
@@ -81,29 +82,26 @@ type BlobClient struct {
 func NewClient(obj *sourcev1.Bucket, secret *corev1.Secret) (c *BlobClient, err error) {
 	c = &BlobClient{}
 
-	// Without a Secret, we can return a simple client.
-	if secret == nil || len(secret.Data) == 0 {
-		c.ServiceClient, err = azblob.NewServiceClientWithNoCredential(obj.Spec.Endpoint, nil)
-		return
+	// Attempt shared key credentials if accountKey is provided
+	if secret != nil || len(secret.Data) > 0 {
+		var cred *azblob.SharedKeyCredential
+		cred, err = sharedCredentialFromSecret(obj.Spec.Endpoint, secret)
+		if err != nil {
+			return
+		}
+		if cred != nil {
+			c.ServiceClient, err = azblob.NewServiceClientWithSharedKey(obj.Spec.Endpoint, cred, &azblob.ClientOptions{})
+			return
+		}
 	}
 
-	// Attempt AAD Token Credential options first.
+	// Attempt AAD Token Credential options
 	var token azcore.TokenCredential
 	if token, err = tokenCredentialFromSecret(secret); err != nil {
 		return
 	}
 	if token != nil {
 		c.ServiceClient, err = azblob.NewServiceClient(obj.Spec.Endpoint, token, nil)
-		return
-	}
-
-	// Fallback to Shared Key Credential.
-	cred, err := sharedCredentialFromSecret(obj.Spec.Endpoint, secret)
-	if err != nil {
-		return
-	}
-	if cred != nil {
-		c.ServiceClient, err = azblob.NewServiceClientWithSharedKey(obj.Spec.Endpoint, cred, &azblob.ClientOptions{})
 		return
 	}
 
@@ -120,30 +118,39 @@ func ValidateSecret(secret *corev1.Secret) error {
 	}
 
 	var valid bool
-	if _, hasTenantID := secret.Data[tenantIDField]; hasTenantID {
-		if _, hasClientID := secret.Data[clientIDField]; hasClientID {
-			if _, hasClientSecret := secret.Data[clientSecretField]; hasClientSecret {
-				valid = true
-			}
-			if _, hasClientCertificate := secret.Data[clientCertificateField]; hasClientCertificate {
-				valid = true
-			}
-		}
-	}
-	if _, hasResourceID := secret.Data[resourceIDField]; hasResourceID {
-		valid = true
-	}
-	if _, hasClientID := secret.Data[clientIDField]; hasClientID {
-		valid = true
-	}
 	if _, hasAccountKey := secret.Data[accountKeyField]; hasAccountKey {
 		valid = true
 	}
+	if enablePerBucketIdentity() {
+		if _, hasTenantID := secret.Data[tenantIDField]; hasTenantID {
+			if _, hasClientID := secret.Data[clientIDField]; hasClientID {
+				if _, hasClientSecret := secret.Data[clientSecretField]; hasClientSecret {
+					valid = true
+				}
+				if _, hasClientCertificate := secret.Data[clientCertificateField]; hasClientCertificate {
+					valid = true
+				}
+			}
+		}
+		if _, hasResourceID := secret.Data[resourceIDField]; hasResourceID {
+			valid = true
+		}
+		if _, hasClientID := secret.Data[clientIDField]; hasClientID {
+			valid = true
+		}
+
+		if !valid {
+			return fmt.Errorf("invalid '%s' secret data: requires a '%s', '%s', or '%s' field, a combination of '%s', '%s' and '%s', or '%s', '%s' and '%s'",
+				secret.Name, resourceIDField, clientIDField, accountKeyField, tenantIDField, clientIDField, clientSecretField, tenantIDField, clientIDField, clientCertificateField)
+		}
+
+		return nil
+	}
 
 	if !valid {
-		return fmt.Errorf("invalid '%s' secret data: requires a '%s', '%s', or '%s' field, a combination of '%s', '%s' and '%s', or '%s', '%s' and '%s'",
-			secret.Name, resourceIDField, clientIDField, accountKeyField, tenantIDField, clientIDField, clientSecretField, tenantIDField, clientIDField, clientCertificateField)
+		return fmt.Errorf("invalid '%s' secret data: requires a '%s' field", secret.Name, accountKeyField)
 	}
+
 	return nil
 }
 
@@ -270,30 +277,53 @@ func (c *BlobClient) ObjectIsNotFound(err error) bool {
 	return false
 }
 
+func enablePerBucketIdentity() bool {
+	if perBucketIdentitySetting, ok := os.LookupEnv("PER_BUCKET_IDENTITY"); ok {
+		return perBucketIdentitySetting == "1" || strings.ToLower(perBucketIdentitySetting) == "true"
+	}
+	return false
+}
+
 func tokenCredentialFromSecret(secret *corev1.Secret) (azcore.TokenCredential, error) {
-	clientID, hasClientID := secret.Data[clientIDField]
-	if tenantID, hasTenantID := secret.Data[tenantIDField]; hasTenantID && hasClientID {
-		if clientSecret, hasClientSecret := secret.Data[clientSecretField]; hasClientSecret && len(clientSecret) > 0 {
-			return azidentity.NewClientSecretCredential(string(tenantID), string(clientID), string(clientSecret), nil)
-		}
-		if clientCertificate, hasClientCertificate := secret.Data[clientCertificateField]; hasClientCertificate && len(clientCertificate) > 0 {
-			certs, key, err := azidentity.ParseCertificates(clientCertificate, secret.Data[clientCertificatePasswordField])
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse client certificates: %w", err)
+	// TODO: ideally this could be replaced by azidentity.NewDefaultAzureCredential(nil)
+	//  after it can support the scenario with multiple managed identities
+
+	cred, err := azidentity.NewEnvironmentCredential(nil)
+	if cred != nil {
+		return cred, err
+	}
+
+	clientID := os.Getenv("AZURE_CLIENT_ID")
+	if enablePerBucketIdentity() {
+		clientID = string(secret.Data[clientIDField])
+		if tenantID, hasTenantID := secret.Data[tenantIDField]; hasTenantID && clientID != "" {
+			if clientSecret, hasClientSecret := secret.Data[clientSecretField]; hasClientSecret && len(clientSecret) > 0 {
+				return azidentity.NewClientSecretCredential(string(tenantID), clientID, string(clientSecret), nil)
 			}
-			return azidentity.NewClientCertificateCredential(string(tenantID), string(clientID), certs, key, nil)
+			if clientCertificate, hasClientCertificate := secret.Data[clientCertificateField]; hasClientCertificate && len(clientCertificate) > 0 {
+				certs, key, err := azidentity.ParseCertificates(clientCertificate, secret.Data[clientCertificatePasswordField])
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse client certificates: %w", err)
+				}
+				o := &azidentity.ClientCertificateCredentialOptions{}
+				if v, ok := secret.Data[clientCertificateSendChainField]; ok {
+					o.SendCertificateChain = string(v) == "1" || strings.ToLower(string(v)) == "true"
+				}
+				return azidentity.NewClientCertificateCredential(string(tenantID), string(clientID), certs, key, o)
+			}
 		}
 	}
-	if hasClientID {
+	if clientID != "" {
 		return azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
 			ID: azidentity.ClientID(clientID),
 		})
 	}
-	if resourceID, hasResourceID := secret.Data[resourceIDField]; hasResourceID {
-		return azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
-			ID: azidentity.ResourceID(resourceID),
-		})
-	}
+	// TODO: this could remove because you can always get the client ID
+	//if resourceID, hasResourceID := secret.Data[resourceIDField]; hasResourceID {
+	//	return azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+	//		ID: azidentity.ResourceID(resourceID),
+	//	})
+	//}
 	return nil, nil
 }
 
